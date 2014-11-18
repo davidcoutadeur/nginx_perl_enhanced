@@ -545,7 +545,7 @@ header_in_set(r, key, value)
     ngx_table_elt_t     *header;
 
     ngx_list_part_t     *part, *last, *prev;
-    ngx_list_part_t     *real_last;
+    ngx_list_part_t     *real_last, *prev_last;
     ngx_table_elt_t     *h;
     ngx_uint_t          i;
 
@@ -562,6 +562,8 @@ header_in_set(r, key, value)
     ngx_err_t e;
     e = SvIV(key);
 
+
+    prev_last = r->headers_in.headers.last;
 
     /*
        Find last part
@@ -601,8 +603,6 @@ header_in_set(r, key, value)
     }
 
 
-
-
     // Get header key as a string
     if (ngx_http_perl_sv2str(aTHX_ r, &ngxkey, key) != NGX_OK) {
         XSRETURN_EMPTY;
@@ -612,124 +612,173 @@ header_in_set(r, key, value)
         XSRETURN_EMPTY;
     }
   
-    /*
-       USE CASE: UNSET HEADER
+
+    // create a new header
+    header = ngx_list_push(&r->headers_in.headers);
+    if (header == NULL) {
+        XSRETURN_EMPTY;
+    }
+
+    if (ngx_http_perl_sv2str(aTHX_ r, &header->key, key) != NGX_OK) {
+        XSRETURN_EMPTY;
+    }
+
+    if (ngx_http_perl_sv2str(aTHX_ r, &header->value, value) != NGX_OK) {
+        XSRETURN_EMPTY;
+    }
+
+    if (header->value.len == 0) {
+        header->hash = 0;
+    } else {
+        header->hash = ngx_hash_key_lc(header->key.data, header->key.len);
+    }
+
+    header->lowcase_key = ngx_pnalloc(r->pool, header->key.len);
+    if (header->lowcase_key == NULL) {
+        XSRETURN_EMPTY;
+    }
+
+    ngx_strlow(header->lowcase_key, header->key.data, header->key.len);
+
+    part = &r->headers_in.headers.part;
+    last = r->headers_in.headers.last;
+
+    /* Hook to re-organize headers.
+     At first, headers_in.headers->last is a complete different part,
+     and its elements point to real last part one
+     not present in the chained part structure.
     */
-    if (ngx_strcasecmp( (u_char *) ngxvalue.data, (u_char *) "undef") == 0 ) {
+    if( real_last != last) { // last part is not in the chain
+      if(last->nelts == 1) { // new part was added
+        real_last->next = last;
+        
+      }
+      else { // no new part, just fix nelts in current part
+        real_last->nelts = last->nelts;
+      }
+    }
+
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, e, "SET - build nelts: %d for %s / last nelts: %d", part->nelts, header->key.data, last->nelts);
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, e, "SET - part: %p / last: %p", part, last);
+
+
+
+void
+header_in_unset(r, key)
+    CODE:
+
+    ngx_http_request_t  *r;
+    SV                  *key;
+    ngx_str_t           ngxkey;
+    ngx_table_elt_t     *header;
+
+    ngx_list_part_t     *part, *last, *prev, *cur;
+    ngx_list_part_t     *real_last;
+    ngx_table_elt_t     *h;
+    ngx_uint_t          i,j;
+
+    ngx_list_t		*new_list;
+    ngx_table_elt_t     *list_element;
+
+ 
+
+    ngx_http_perl_set_request(r);
+
+    key = ST(1);
+
+    ngx_err_t e;
+    e = SvIV(key);
+
+
+    /*
+       Find last part
+     */
+    part = &r->headers_in.headers.part;
+    last = r->headers_in.headers.last;
+    
+    ngx_uint_t nb_part=0;
+    for (i = 0; /* void */ ; i++) {
+      if (i >= part->nelts) {
+        if (part->next == NULL) {
+          // found last part, this is it!
+          real_last = part;
+          break;
+        }
+        i=0;
+        ++nb_part;
+        part = part->next;
+      }
+      ngx_log_error(NGX_LOG_ERR, r->connection->log, e, "part: %d:%p / i: %d / key: %s / addr: %p", nb_part, part, i, (*((ngx_table_elt_t*)part->elts+i)).key.data, part->elts);
+    }
+
+
+    // Get header key as a string
+    if (ngx_http_perl_sv2str(aTHX_ r, &ngxkey, key) != NGX_OK) {
+        XSRETURN_EMPTY;
+    }
   
-      // Get the first part of the list. There is usually only one part.
-      part = &r->headers_in.headers.part;
-      h = part->elts;
-   
-      /*
-      Headers list array may consist of more than one part,
-      so loop through all of it
-      */
-      for (i = 0; /* void */ ; ++i) {
-          if (i >= part->nelts) {
-              if (part->next == NULL) {
-                  /* The last part, search is done. */
-                  break;
-              }
-   
-              part = part->next;
-              h = part->elts;
-              i = 0;
-          }
+    // Get the first part of the list. There is usually only one part.
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+ 
+    /*
+    Headers list array may consist of more than one part,
+    so loop through all of it
+    */
+    for (i = 0; /* void */ ; ++i) {
 
-
-          ngx_log_error(NGX_LOG_ERR, r->connection->log, e, "UNSET - i: %d / nelts: %d / data: %s", i, part->nelts, h[i].key.data);
-
-          // Just compare the lengths and then the names case insensitively.
-          if (ngxkey.len == h[i].key.len && ngx_strcasecmp(ngxkey.data, h[i].key.data) == 0) {
-            /* This header matches and will not be added to new_list */
-	    ngx_log_error(NGX_LOG_ERR, r->connection->log, e,
-                                       "UNSET - deleting header %s", ngxkey.data);
-            part = &r->headers_in.headers.part;
-            last = r->headers_in.headers.last;
-            memcpy(&h[i],
-                   (((ngx_table_elt_t*)real_last->elts)+(real_last->nelts-1)),
-                   sizeof(ngx_table_elt_t));
-            --last->nelts;
-            if(last->nelts == 0) { // must delete last part
-              /* Hook to re-organize headers.
-               At first, headers_in.headers->last is a complete different part,
-               not present in the chained part structure.
-              */
-              if( real_last->nelts != last->nelts) { // last part is not in the chain
-                real_last->nelts = 0;
-              }
-              else { // last part is in the chain
-              }
-              // find pre-last part
-              prev = part;
-              for (i = 0; /* void */ ; i++) {
-                if (part->nelts == 0) {
-                  // found last part, pre-last part is before
-                  break;
-                }
-                prev = part;
-                part = part->next;
-              }
-              prev->next = NULL; // free memory ?
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                /* The last part, search is done. */
+                break;
             }
+ 
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, e, "UNSET - i: %d / nelts: %d / data: %s", i, part->nelts, h[i].key.data);
+
+        // Just compare the lengths and then the names case insensitively.
+        if (ngxkey.len == h[i].key.len && ngx_strcasecmp(ngxkey.data, h[i].key.data) == 0) {
+          /* This header matches and will not be added to new_list */
+	    ngx_log_error(NGX_LOG_ERR, r->connection->log, e,
+                                     "UNSET - deleting header %s", ngxkey.data);
+          part = &r->headers_in.headers.part;
+          memcpy(&h[i],
+                 (((ngx_table_elt_t*)real_last->elts)+(real_last->nelts-1)),
+                 sizeof(ngx_table_elt_t));
+          --last->nelts;
+          // Hook to deal with last part
+          if( real_last != last) { // last part is not in the chain
+            --real_last->nelts;
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, e, "UNSET - last part not in the chain");
           }
-      }
-    }
+          if(last->nelts == 0) { // must delete last part
+            // ASSUMPTION: if we have to delete last part, then we have previously added
+            // enough parts so that last part is necessary in the chain
+            // find pre-last part
+            cur = &r->headers_in.headers.part;
+            prev = cur;
+            for (j = 0; /* void */ ; j++) {
+              if (cur->nelts == 0) {
+                // found last part, pre-last part is before
+                break;
+              }
+              prev = cur;
+              cur = cur->next;
+            }
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, e, "UNSET - last: %p:%d / prev: %p:%d / cur: %p:%d", last, last->nelts, prev, prev->nelts, cur, cur->nelts);
+            prev->next = NULL;
+            
+            last = prev;
+            r->headers_in.headers.last = prev;
 
-    /*
-       USE CASE: SET HEADER
-    */
-    else {
-
-      // create a new header
-      header = ngx_list_push(&r->headers_in.headers);
-      if (header == NULL) {
-          XSRETURN_EMPTY;
-      }
-
-      if (ngx_http_perl_sv2str(aTHX_ r, &header->key, key) != NGX_OK) {
-          XSRETURN_EMPTY;
-      }
-
-      if (ngx_http_perl_sv2str(aTHX_ r, &header->value, value) != NGX_OK) {
-          XSRETURN_EMPTY;
-      }
-  
-      if (header->value.len == 0) {
-          header->hash = 0;
-      } else {
-          header->hash = ngx_hash_key_lc(header->key.data, header->key.len);
-      }
-  
-      header->lowcase_key = ngx_pnalloc(r->pool, header->key.len);
-      if (header->lowcase_key == NULL) {
-          XSRETURN_EMPTY;
-      }
-  
-      ngx_strlow(header->lowcase_key, header->key.data, header->key.len);
-
-      part = &r->headers_in.headers.part;
-      last = r->headers_in.headers.last;
-
-      /* Hook to re-organize headers.
-       At first, headers_in.headers->last is a complete different part,
-       not present in the chained part structure.
-      */
-      if( real_last->nelts != last->nelts) { // last part is not in the chain
-        if(last->nelts == 1) { // new part was added
-          real_last->next = last;
-          
+          }
         }
-        else { // no new part, just fix nelts in current part
-          real_last->nelts = last->nelts;
-        }
-      }
-      ngx_log_error(NGX_LOG_ERR, r->connection->log, e, "SET - build nelts: %d for %s / last nelts: %d", part->nelts, header->key.data, last->nelts);
-      ngx_log_error(NGX_LOG_ERR, r->connection->log, e, "SET - part: %p / last: %p", part, last);
-
     }
-
 
 void
 filename(r)
